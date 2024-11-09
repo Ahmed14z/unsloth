@@ -16,14 +16,17 @@ import triton
 import triton.language as tl
 import torch
 from .utils import calculate_settings
-# Initialize device for multi-GPU support
+import os
+
+# I Initialize device for multi-GPU support
 if torch.distributed.is_initialized():
-    # Set device based on local rank for each process
-    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    # Retrieve `LOCAL_RANK` from environment and ensure it’s valid
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 else:
-    # Single GPU or non-DDP environment
+    # Single GPU or CPU environment
+    local_rank = 0
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Set the current device for this process only if it hasn't been set by another script
