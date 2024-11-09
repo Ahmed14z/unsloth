@@ -16,11 +16,18 @@ import triton
 import triton.language as tl
 import torch
 from .utils import calculate_settings
-
 # Initialize device for multi-GPU support
-device = torch.device(f"cuda:{torch.distributed.get_rank()}" if torch.distributed.is_initialized() else "cuda")
-torch.cuda.set_device(device)
+if torch.distributed.is_initialized():
+    # Set device based on local rank for each process
+    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+else:
+    # Single GPU or non-DDP environment
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+# Set the current device for this process only if it hasn't been set by another script
+torch.cuda.set_device(local_rank)
 @triton.jit
 def _rms_layernorm_forward(
     Y, Y_row_stride,
