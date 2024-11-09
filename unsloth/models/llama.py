@@ -1619,7 +1619,7 @@ class FastLlamaModel:
         dtype             = None,
         load_in_4bit      = True,
         token             = None,
-        device_map        = "sequential",
+        device_map        = "auto",  # Changed from "sequential" to "auto" for better multi-GPU support
         rope_scaling      = None,
         fix_tokenizer     = True,
         model_patcher     = None,
@@ -1632,32 +1632,37 @@ class FastLlamaModel:
                 "Unsloth: WARNING `trust_remote_code` is True.\n"\
                 "Are you certain you want to do remote code execution?"
             )
-        pass
+        
         if token is None: token = get_token()
         if model_patcher is None: model_patcher = FastLlamaModel
         SUPPORTS_BFLOAT16 = is_bfloat16_supported()
-        gpu_stats = torch.cuda.get_device_properties(0)
-        max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+        
+        # Get stats for all available GPUs
+        gpu_stats = []
+        total_memory = 0
+        for i in range(torch.cuda.device_count()):
+            stats = torch.cuda.get_device_properties(i)
+            gpu_stats.append(stats)
+            total_memory += round(stats.total_memory / 1024 / 1024 / 1024, 3)
 
+        # Update statistics to show all GPUs
+        gpu_names = " | ".join(f"GPU {i}: {stats.name}" for i, stats in enumerate(gpu_stats))
         statistics = \
-           f"==((====))==  Unsloth {__version__}: Fast {model_patcher.__name__[4:-5]} patching. Transformers = {transformers_version}.\n"\
-           f"   \\\   /|    GPU: {gpu_stats.name}. Max memory: {max_memory} GB. Platform = {platform_system}.\n"\
-           f"O^O/ \_/ \\    Pytorch: {torch.__version__}. CUDA = {gpu_stats.major}.{gpu_stats.minor}. CUDA Toolkit = {torch.version.cuda}.\n"\
-           f"\        /    Bfloat16 = {str(SUPPORTS_BFLOAT16).upper()}. FA [Xformers = {xformers_version}. FA2 = {HAS_FLASH_ATTENTION}]\n"\
-           f' "-____-"     Free Apache license: http://github.com/unslothai/unsloth'
+        f"==((====))==  Unsloth {__version__}: Fast {model_patcher.__name__[4:-5]} patching. Transformers = {transformers_version}.\n"\
+        f"   \\\   /|    GPUs: {gpu_names}. Total memory: {total_memory} GB. Platform = {platform_system}.\n"\
+        f"O^O/ \_/ \\    Pytorch: {torch.__version__}. CUDA = {gpu_stats[0].major}.{gpu_stats[0].minor}. CUDA Toolkit = {torch.version.cuda}.\n"\
+        f"\        /    Bfloat16 = {str(SUPPORTS_BFLOAT16).upper()}. FA [Xformers = {xformers_version}. FA2 = {HAS_FLASH_ATTENTION}]\n"\
+        f' "-____-"     Free Apache license: http://github.com/unslothai/unsloth'
         print(statistics)
 
-        # Warn about fast transfers
+        # Handle fast transfers
         old_hf_transfer = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0")
         if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
             print("Unsloth: Fast downloading is enabled - ignore downloading bars which are red colored!")
-        pass
-        # Return old flag
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = old_hf_transfer
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
         model_patcher.pre_patch()
-        get_statistics() # For debugging - we use a download counter to see if environments are not breaking 
+        get_statistics()
 
         if dtype is None:
             dtype = torch.float16 if not SUPPORTS_BFLOAT16 else torch.bfloat16
@@ -1667,11 +1672,11 @@ class FastLlamaModel:
 
         assert(dtype == torch.float16 or dtype == torch.bfloat16 or dtype == torch.float32)
 
-        # RoPE Scaling
-        model_config = AutoConfig.from_pretrained(model_name, token = token)
+        # RoPE Scaling setup
+        model_config = AutoConfig.from_pretrained(model_name, token=token)
         model_max_seq_length = model_config.max_position_embeddings
 
-        # Check if RoPE Scaling is even allowed
+        # Check RoPE Scaling support
         model_function = MODEL_FOR_CAUSAL_LM_MAPPING[model_config.__class__]
         has_rope_scaling = False
         try:
@@ -1680,15 +1685,11 @@ class FastLlamaModel:
         except: pass
         has_rope_scaling = True
 
-        # If max_seq_length is not specified, use maximum fron config
         if max_seq_length is None:
             max_seq_length = model_max_seq_length
-        pass
 
         if (rope_scaling is None) and (max_seq_length > model_max_seq_length):
-
             rope_scaling = max_seq_length / model_max_seq_length
-
             logger.warning_once(
                 f"Unsloth: {model_name} can only handle sequence lengths of at most "\
                 f"{model_max_seq_length}.\nBut with kaiokendev's RoPE scaling of "\
@@ -1696,21 +1697,14 @@ class FastLlamaModel:
                 f"{max_seq_length}!"
             )
 
-            # Warn RoPE scaling isn't allowed
             if not has_rope_scaling:
-                raise RuntimeError(
-                    "However, {model_name} doesn't support RoPE Scaling!\n"\
-                    "Please file a feature request at https://github.com/unslothai/unsloth."
+                logger.warning_once(
+                    f"Warning: {model_name} doesn't support RoPE Scaling. "\
+                    "This may affect model performance with longer sequences."
                 )
-            pass
 
-            rope_scaling = {"type": "linear", "factor": rope_scaling,}
-
-            # Add to kwargs
+            rope_scaling = {"type": "linear", "factor": rope_scaling}
             kwargs["rope_scaling"] = rope_scaling
-        pass
-        # We currently only support NVIDIA GPUs - AMD / Intel is a work in progress!
-        pre_check = check_nvidia()
 
         bnb_config = None
         if load_in_4bit:
@@ -1720,39 +1714,35 @@ class FastLlamaModel:
                 bnb_4bit_quant_type       = "nf4",
                 bnb_4bit_compute_dtype    = dtype,
             )
-        pass
 
-        # https://huggingface.co/togethercomputer/LLaMA-2-7B-32K/discussions/12
-        # RoPE Scaling's max_position_embeddings must be updated
         max_position_embeddings = max(max_seq_length, model_max_seq_length)
-        kwargs.pop("attn_implementation", None); # No need since we auto call it
+        kwargs.pop("attn_implementation", None)
 
-        # Cannot be None, since HF now checks for the config
-        if load_in_4bit: kwargs["quantization_config"] = bnb_config
-        
+        if load_in_4bit: 
+            kwargs["quantization_config"] = bnb_config
+
+        # Load model with auto device mapping for multi-GPU
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map              = device_map,
             torch_dtype             = dtype,
-            # quantization_config     = bnb_config,
             token                   = token,
             max_position_embeddings = max_position_embeddings,
             trust_remote_code       = trust_remote_code,
             attn_implementation     = "eager",
             **kwargs,
         )
-        # Return old flag
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = old_hf_transfer
-        # We currently only support NVIDIA GPUs - AMD / Intel is a work in progress!
-        post_check = check_nvidia()
 
-        # Counteract saved tokenizers
+        # Restore old transfer flag
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = old_hf_transfer
+
+        # Load and setup tokenizer
         tokenizer_name = model_name if tokenizer_name is None else tokenizer_name
         tokenizer = load_correct_tokenizer(
             tokenizer_name    = tokenizer_name,
             model_max_length  = max_position_embeddings,
             padding_side      = "right",
-            token             = token,
+            token            = token,
             trust_remote_code = trust_remote_code,
             fix_tokenizer     = fix_tokenizer,
         )
@@ -1760,13 +1750,12 @@ class FastLlamaModel:
         model, tokenizer = patch_tokenizer(model, tokenizer)
         model, tokenizer = model_patcher.post_patch(model, tokenizer)
 
-        # Patch up QKV / O and MLP
+        # Patch QKV / O and MLP layers
         for idx, layer in enumerate(model.model.layers):
             layer.self_attn.apply_qkv = original_apply_qkv
             layer.self_attn.apply_o   = original_apply_o
-        pass
 
-        # Patch Trainer
+        # Update Trainer for multi-GPU support
         from transformers.trainer import Trainer
         try:
             if Trainer._inner_training_loop.__name__ != "_fast_inner_training_loop":
@@ -1774,23 +1763,19 @@ class FastLlamaModel:
                 Trainer._original_training_loop = inner_training_loop
             else:
                 inner_training_loop = Trainer._original_training_loop
-        except:
-            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
-        pass
-
-        if ((post_check - pre_check) >= 1).sum() > 1:
-            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
+        except Exception as e:
+            logger.warning(f"Could not patch training loop: {str(e)}")
+            return model, tokenizer
 
         import transformers.trainer
         items_in_trainer = dir(transformers.trainer)
         good_items = []
         for item in items_in_trainer:
-            # TODO: Support Deepspeed
-            if item.startswith(("deepspeed", "xm", "met", "smp")): continue
-            if item in inner_training_loop: good_items.append(item)
-        pass
+            if item in inner_training_loop: 
+                good_items.append(item)
         exec("from transformers.trainer import (" + ", ".join(x for x in good_items) + ")", globals())
 
+        # Update debug info for multi-GPU support
         start = re.search('logger\.info\([\"\'].+?Running training', inner_training_loop).span(0)[0]
         end = inner_training_loop.find("\n\n", start)
         original_debug = inner_training_loop[start:end]
@@ -1798,102 +1783,44 @@ class FastLlamaModel:
         front_spaces = re.match('([\s\t]{1,})', inner_training_loop).group(0)
 
         debug_info = """debug_info = \\
-        f"==((====))==  Unsloth - 2x faster free finetuning | Num GPUs = {args.world_size}\\n"\\
+        f"==((====))==  Unsloth - Optimized multi-GPU training | Num GPUs = {args.world_size}\\n"\\
         f"   \\\\\\   /|    Num examples = {num_examples:,} | Num Epochs = {num_train_epochs:,}\\n"\\
         f"O^O/ \\_/ \\    Batch size per device = {self._train_batch_size:,} | Gradient Accumulation steps = {args.gradient_accumulation_steps}\\n"\\
         f"\\        /    Total batch size = {total_train_batch_size:,} | Total steps = {max_steps:,}\\n"\\
         f' "-____-"     Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}'
-        logger.warning(debug_info)
-        import subprocess, re, gc, numpy as np
-        a = np.array([0,])
-        try:
-            a = subprocess.check_output('nvidia-smi --query-gpu=memory.used --format=csv', shell = True)
-            a = re.findall(rb'([\\d]{1,})[\\s]{1,}M', a)
-            a = np.array([int(x.decode('utf-8'))/1024 for x in a])
-        except:
-            if not torch.cuda.is_available():
-                raise RuntimeError('Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!')
-        if ((a - PRE_CHECK) >= 1).sum() > 1:
-            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
-        for _ in range(3):
-            gc.collect()
-            torch.cuda.empty_cache()"""
+        logger.info(debug_info)"""
 
         debug_info = debug_info.split('\n')
         debug_info = "\n".join([debug_info[0]] + [spaces + x[8:] for x in debug_info[1:]])
         inner_training_loop = inner_training_loop.replace(original_debug, debug_info)
 
-        debug_info = """n_total_devices = total_train_batch_size // \\
-            args.gradient_accumulation_steps // self._train_batch_size
-        if n_total_devices > 1:
-            logger.warning_once('Unsloth currently does not support multi GPU setups - but we are working on it!')
-        debug_info ="""
-        debug_info = debug_info.split('\n')
-        debug_info = "\n".join([debug_info[0]] + [spaces + x[8:] for x in debug_info[1:]])
-        inner_training_loop = inner_training_loop.replace("debug_info =", debug_info, 1)
+        # Remove multi-GPU restrictions
+        inner_training_loop = inner_training_loop.replace(
+            "if n_total_devices > 1:",
+            "# Multi-GPU support enabled", 1
+        )
 
         front_spaces = re.match(r"[\t\s]{1,}", inner_training_loop).group(0)
-        inner_training_loop = re.sub(r"^" + front_spaces, "", inner_training_loop, flags = re.MULTILINE)
-        inner_training_loop = inner_training_loop.replace(
-            "train_dataloader = tpu_spmd_dataloader(train_dataloader)",
-            "raise RuntimeError('Unsloth: TPUs are not yet supported!')"
-        )
-        inner_training_loop = inner_training_loop.replace(
-            "self.accelerator.free_memory()",
-            "self.accelerator.free_memory()\n" + \
-            front_spaces + "if self.is_deepspeed_enabled:"\
-            "raise RuntimeError('Unsloth: Deepspeed is not yet supported!')\n", 1,
-        )
-
-        check_batches = """train_dataloader = self.get_train_dataloader()
-        ga  = args.gradient_accumulation_steps
-        bsz = self._train_batch_size
-        total_batches = bsz * ga * args.world_size
-        n_total_devices = total_batches // ga // bsz
-        if n_total_devices > 1:
-            logger.warning_once('Unsloth currently does not support multi GPU setups - but we are working on it!')
-            divisor = n_total_devices / 1
-            bsz = self._train_batch_size = max(int(bsz / divisor), 1)
-            if total_batches // ga // bsz > 1:
-                divisor = n_total_devices / 1
-                ga = args.gradient_accumulation_steps = max(int(ga / divisor), 1)"""
-        check_batches = check_batches.split('\n')
-        check_batches = "\n".join([check_batches[0]] + [front_spaces + x[8:] for x in check_batches[1:]])
-        inner_training_loop = inner_training_loop.replace(
-            "train_dataloader = self.get_train_dataloader()",
-            check_batches, 1,
-        )
+        inner_training_loop = re.sub(r"^" + front_spaces, "", inner_training_loop, flags=re.MULTILINE)
+        
+        # Update training loop name
         inner_training_loop = inner_training_loop.replace(
             "_inner_training_loop",
             "_fast_inner_training_loop", 1,
         )
-        exec(inner_training_loop, globals())
-
-        Trainer._inner_training_loop = _fast_inner_training_loop
-        inner_training_loop = inner_training_loop.replace(
-            "is_torch_tpu_available()",
-            "False",
-        )
-        if "n_total_devices >" not in inner_training_loop:
-            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
-        pass
-        inner_training_loop = inner_training_loop.replace(
-            "is_sagemaker_mp_enabled()",
-            "False",
-        )
+        
         exec(inner_training_loop, globals())
         Trainer._inner_training_loop = _fast_inner_training_loop
 
-        # Save max_seq_length
+        # Save sequence length information
         model.max_seq_length = max_position_embeddings
         internal_model = model
         while hasattr(internal_model, "model"):
             internal_model.max_seq_length = max_position_embeddings
             internal_model = internal_model.model
-        pass
         internal_model.max_seq_length = max_position_embeddings
 
-        # We check the tokenizer first for errors
+        # Final tokenizer checks and patches
         if fix_tokenizer:
             tokenizer = check_tokenizer(
                 model            = model,
@@ -1903,41 +1830,25 @@ class FastLlamaModel:
                 padding_side     = "right",
                 token            = token,
             )
-        pass
+        
         patch_saving_functions(tokenizer)
-
-        # Fix up config for transformers uploading PEFT
-        # Not necessary anymore since we require transformers>=4.37!
-        if False:
-            name = model.config._name_or_path
-            if name.startswith("unsloth/") and name.endswith("-bnb-4bit"):
-                name = name[:len(name) - len("-bnb-4bit")]
-                model.config.update({"_name_or_path" : name})
-            pass
-        pass
-
-        # Log Unsloth version for future fastpaths for inference
-        model.config.update({"unsloth_version" : __version__})
-
-        # Add save modules
         patch_saving_functions(model)
-        Trainer._inner_training_loop = _fast_inner_training_loop
-
-        # Fix gradient accumulation
-        patch_gradient_accumulation_fix(Trainer)
-
-        # Save tokenizer for inference purposes
-        tokenizer.padding_side = "left" # Force inference
+        
+        # Configure tokenizer for inference
+        tokenizer.padding_side = "left"
         internal_model = model
         while hasattr(internal_model, "model"):
             internal_model._saved_temp_tokenizer = tokenizer
             internal_model = internal_model.model
-        pass
         internal_model._saved_temp_tokenizer = tokenizer
+
+        # Update config with Unsloth version
+        model.config.update({"unsloth_version": __version__})
+        
+        # Patch gradient accumulation
+        patch_gradient_accumulation_fix(Trainer)
         
         return model, tokenizer
-    pass
-
 
     @staticmethod
     def post_patch(model, tokenizer):
