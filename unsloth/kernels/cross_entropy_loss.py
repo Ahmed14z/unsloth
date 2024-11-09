@@ -268,16 +268,25 @@ pass
 
 MAX_FUSED_SIZE = 65536 # 2**16
 
+import triton
+import triton.language as tl
+import torch
+from packaging.version import Version
+
+
 class Fast_CrossEntropyLoss(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, labels, logit_softcapping : float = 0, logit_scaling : float = 0):
         n_rows : int
         vocab_size : int
         n_rows, vocab_size = logits.shape
+        
+        # Get device from input tensor
+        device = logits.device
 
         div, mod = divmod(vocab_size, MAX_FUSED_SIZE)
         n_chunks : int = div + (mod != 0)
-        losses = torch.empty(n_rows, dtype = torch.float32, device = "cuda:0")
+        losses = torch.empty(n_rows, dtype=torch.float32, device=device)
 
         DO_SOFTCAPPING   : bool = bool(logit_softcapping != 0)
         DO_LOGIT_SCALING : bool = bool(logit_scaling != 0)
@@ -287,7 +296,7 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
         if n_chunks == 1:
             # For small vocabs <= 65336 like Llama, Mistral
             BLOCK_SIZE, num_warps = calculate_settings(vocab_size)
-            logsumexp = torch.empty(n_rows, dtype = torch.float32, device = "cuda:0")
+            logsumexp = torch.empty(n_rows, dtype=torch.float32, device=device)
 
             _cross_entropy_forward[(n_rows,)](
                 logits, logits.stride(0),
@@ -304,7 +313,7 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
             )
         else:
             # For large vocabs > 65336 like Gemma 256K
-            logsumexp = torch.empty((n_rows, n_chunks,), dtype = torch.float32, device = "cuda:0")
+            logsumexp = torch.empty((n_rows, n_chunks,), dtype=torch.float32, device=device)
 
             _chunked_cross_entropy_forward[(n_rows, n_chunks,)](
                 logits, logits.stride(0),
@@ -322,10 +331,9 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
             )
             # logsumexp(chunked_logsumexp) - x
             # Do the -x separately
-            logsumexp = torch.logsumexp(logsumexp, dim = 1) # Row sum
+            logsumexp = torch.logsumexp(logsumexp, dim=1) # Row sum
             losses += logsumexp
             losses.masked_fill_(labels == -100, 0) # Don't forget to mask padding out!
-        pass
 
         ctx.save_for_backward(logits, logsumexp, labels)
         ctx.DO_SOFTCAPPING    = DO_SOFTCAPPING
@@ -333,8 +341,6 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
         ctx.DO_LOGIT_SCALING  = DO_LOGIT_SCALING
         ctx.logit_scaling     = logit_scaling
         return losses
-    pass
-
 
     @staticmethod
     def backward(ctx, dlosses):
@@ -362,10 +368,7 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
             LOGIT_SCALE      = ctx.logit_scaling,
             num_warps        = 8,
         )
-        return logits, None, None, None,
-    pass
-pass
-
+        return logits, None, None, None
 
 def fast_cross_entropy_loss(
     logits,
@@ -376,13 +379,14 @@ def fast_cross_entropy_loss(
 ):
     """
     Arguments:
-        logits: (batch, seq_len, vocab_size)
-        labels: (batch, seq_len,)
+        logits: (batch, seq_len, vocab_size) - Can be on any GPU
+        labels: (batch, seq_len,) - Should be on same device as logits
     Returns:
-        losses: float
+        losses: float - Returns on same device as input
     """
     batch, seq_len, d = logits.shape
     assert(labels.shape == (batch, seq_len))
+    assert(logits.device == labels.device), "Logits and labels must be on same device"
 
     loss = Fast_CrossEntropyLoss.apply(
         logits.view(batch*seq_len, d),
@@ -393,13 +397,10 @@ def fast_cross_entropy_loss(
     if n_items is None:
         n_items = torch.count_nonzero(labels != -100)
     return loss.sum() / n_items
-pass
+
 if (Version(torch.__version__) < Version("2.4.0")) and \
     not hasattr(fast_cross_entropy_loss, "__wrapped__"):
     fast_cross_entropy_loss = torch._disable_dynamo(fast_cross_entropy_loss)
-pass
 
-# Patch CE Losses in transformers
 def patch_loss_functions():
     _patch_loss_functions(fast_cross_entropy_loss)
-pass

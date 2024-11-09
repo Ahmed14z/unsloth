@@ -1,99 +1,116 @@
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import triton
 import triton.language as tl
 import torch
 from .utils import calculate_settings
+import torch.distributed as dist
+
+
+def setup_distributed(local_rank):
+    """Initialize distributed training"""
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl')
+    return local_rank
 
 
 @triton.jit
-def _fg_kernel(e, g, h, n_elements, BLOCK_SIZE : tl.constexpr,):
+def _fg_kernel(e, g, h, n_elements, BLOCK_SIZE : tl.constexpr):
     block_idx = tl.program_id(0)
     offsets = block_idx*BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
     e_row = tl.load(e + offsets, mask = mask, other = 0).to(tl.float32)
-    g_row = tl.load(g + offsets, mask = mask, other = 0)#.to(tl.float32)
+    g_row = tl.load(g + offsets, mask = mask, other = 0)
 
-    # f = e * sigmoid(e)
-    f_row = e_row * tl.sigmoid(e_row) # e_row / (1 + tl.exp(-e_row))
-    f_row = f_row.to(g_row.dtype) # Exact copy from HF
-    # h = f * g
+    f_row = e_row * tl.sigmoid(e_row)
+    f_row = f_row.to(g_row.dtype)
     h_row = f_row * g_row
 
-    # Store h
     tl.store(h + offsets, h_row, mask = mask)
-pass
 
 
-def swiglu_fg_kernel(e, g):
+def swiglu_fg_kernel(e, g, device=None):
+    """Multi-GPU version of SwiGLU forward pass"""
+    if device is None:
+        device = e.device
+    
     batch, seq_len, hd = e.shape
     n_elements = e.numel()
-    h = torch.empty((batch, seq_len, hd), dtype = e.dtype, device = "cuda:0")
+    
+    # Create output tensor on the same device as input
+    h = torch.empty((batch, seq_len, hd), dtype=e.dtype, device=device)
+    
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    _fg_kernel[grid](e, g, h, n_elements, BLOCK_SIZE = 1024,)
+    _fg_kernel[grid](e, g, h, n_elements, BLOCK_SIZE=1024)
+    
     return h
-pass
 
 
 @triton.jit
-def _DWf_DW_dfg_kernel(DW, e, g, n_elements, BLOCK_SIZE : tl.constexpr,):
-    """
-    e = e.float()
-    se = 1.0 / (1.0 + torch.exp(-e))
-    f = (se * e).to(dtype)
-    h = f * g
-    df = DW * f
-    dg = DW * g
-    de = (dg.float() * se * (1.0 + e * (1.0 - se))).to(dtype)
-    """
+def _DWf_DW_dfg_kernel(DW, e, g, n_elements, BLOCK_SIZE : tl.constexpr):
     block_idx = tl.program_id(0)
     offsets = block_idx*BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    DW_row = tl.load(DW + offsets, mask = mask, other = 0)#.to(tl.float32)
+    DW_row = tl.load(DW + offsets, mask = mask, other = 0)
     e_row  = tl.load(e  + offsets, mask = mask, other = 0).to(tl.float32)
-    g_row  = tl.load(g  + offsets, mask = mask, other = 0)#.to(tl.float32)
+    g_row  = tl.load(g  + offsets, mask = mask, other = 0)
 
-    # e = e.float()
-    # se = 1.0 / (1.0 + torch.exp(-e))
-    se_row = tl.sigmoid(e_row) # 1.0 / (1.0 + tl.exp(-e_row))
-    # f = (se * e).to(dtype)
+    se_row = tl.sigmoid(e_row)
     f_row = se_row * e_row
     f_row = f_row.to(DW_row.dtype)
-    # h = f * g
     h_row  =  f_row * g_row
-    # df = DW * f
     df_row = DW_row * f_row
-    # dg = DW * g
     dg_row = DW_row * g_row
-    # de = (dg.float() * se * (1.0 + e * (1.0 - se))).to(dtype)
     de_row = dg_row.to(tl.float32) * se_row * (1.0 + e_row * (1.0 - se_row))
     de_row = de_row.to(DW_row.dtype)
 
-    # Store derivatives in buffers
-    tl.store(DW + offsets, h_row,  mask = mask) # h  = f * g
-    tl.store(e  + offsets, df_row, mask = mask) # df = DW * f
-    tl.store(g  + offsets, de_row, mask = mask) # de
-pass
+    tl.store(DW + offsets, h_row,  mask = mask)
+    tl.store(e  + offsets, df_row, mask = mask)
+    tl.store(g  + offsets, de_row, mask = mask)
 
 
-def swiglu_DWf_DW_dfg_kernel(DW, e, g):
+def swiglu_DWf_DW_dfg_kernel(DW, e, g, device=None):
+    """Multi-GPU version of SwiGLU backward pass"""
+    if device is None:
+        device = DW.device
+        
     batch_seq_len, hd = e.shape
     n_elements = e.numel()
+    
+    # Ensure all tensors are on the same device
+    DW = DW.to(device)
+    e = e.to(device)
+    g = g.to(device)
+    
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    _DWf_DW_dfg_kernel[grid](DW, e, g, n_elements, BLOCK_SIZE = 1024,)
+    _DWf_DW_dfg_kernel[grid](DW, e, g, n_elements, BLOCK_SIZE=1024)
+    
     return DW, e, g
-pass
+
+
+class DistributedSwiGLU(torch.nn.Module):
+    """Wrapper class for distributed SwiGLU operations"""
+    def __init__(self):
+        super().__init__()
+        self.device = torch.cuda.current_device()
+
+    def forward(self, e, g):
+        return swiglu_fg_kernel(e, g, self.device)
+
+    def backward(self, DW, e, g):
+        return swiglu_DWf_DW_dfg_kernel(DW, e, g, self.device)
+
+
+def shard_tensor(tensor, world_size, rank):
+    """Split tensor across multiple GPUs"""
+    batch_size = tensor.size(0)
+    split_size = batch_size // world_size
+    return tensor[rank * split_size:(rank + 1) * split_size]
+
+
+def gather_tensor(tensor, world_size, rank):
+    """Gather tensor from multiple GPUs"""
+    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor)
+    return torch.cat(gathered, dim=0)
+
