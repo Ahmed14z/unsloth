@@ -18,10 +18,17 @@ import triton.language as tl
 import torch
 from .utils import calculate_settings
 from unsloth_zoo.patching_utils import patch_layernorm
+import os
 
 # Initialize device for multi-GPU support
-device = torch.device(f"cuda:{torch.distributed.get_rank()}" if torch.distributed.is_initialized() else "cuda")
-torch.cuda.set_device(device)
+if torch.distributed.is_initialized():
+    # Retrieve local rank for each process
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))  # Defaults to 0 if not set
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(local_rank)
+else:
+    # Fallback for single GPU or CPU environment
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 @triton.jit
 def layernorm_forward(Y, Y_row_stride, X, X_row_stride, W, b, r, mu, n_cols, eps, BLOCK_SIZE: tl.constexpr):
