@@ -219,8 +219,8 @@ def matmul_lora(X, W, W_quant, A, B, s, out=None):
                 raise ValueError(f"LoRA B matrix dimension mismatch with A. Expected shape[1]={A.shape[0]}, got {B.shape[1]}")
             
             # Compute LoRA adjustment
-            lora_term = torch.matmul(X, A.t())  # First multiplication
-            lora_term = torch.matmul(lora_term, B)  # Second multiplication
+            lora_term = torch.matmul(X, A.t())  # First multiplication: [batch, in_dim] × [in_dim, r] → [batch, r]
+            lora_term = torch.matmul(lora_term, B.t())  # Second multiplication: [batch, r] × [r, out_dim] → [batch, out_dim]
             out += s * lora_term
             
         except RuntimeError as e:
