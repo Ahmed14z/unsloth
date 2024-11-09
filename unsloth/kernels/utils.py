@@ -41,7 +41,7 @@ cdequantize_blockwise_bf16_nf4 = bnb.functional.lib.cdequantize_blockwise_bf16_n
 cgemm_4bit_inference_naive_fp16 = bnb.functional.lib.cgemm_4bit_inference_naive_fp16
 cgemm_4bit_inference_naive_bf16 = bnb.functional.lib.cgemm_4bit_inference_naive_bf16
 
-def calculate_settings(n: int) -> (int, int):
+def calculate_settings(n: int) -> (int, int,):
     BLOCK_SIZE: int = next_power_of_2(n)
     if BLOCK_SIZE > MAX_FUSED_SIZE:
         raise RuntimeError(f"Cannot launch Triton kernel since n = {n} exceeds the maximum CUDA blocksize = {MAX_FUSED_SIZE}.")
@@ -170,17 +170,34 @@ def handle_lora(out, X, lora_A, lora_B, lora_S, bsz, in_dim, temp_lora):
         temp_lora = torch.mm(X.view(bsz, in_dim).to(device), lora_A.t(), out=temp_lora)
         out.addmm_(temp_lora, lora_B.t(), alpha=lora_S)
     return out.view(bsz, 1, out_dim)
-
 def matmul_lora(X, W, W_quant, A, B, s, out=None):
     dtype = X.dtype
+    # Dequantize W if required
     W = fast_dequantize(W.t().to(device), W_quant)
+    
+    # Adjust reshape conditionally based on input dimensions
     reshape = X.dim() == 3
     if reshape:
         batch, seq_len, d = X.shape
         X = X.view(-1, X.shape[-1])
+
+    # Initial matrix multiplication of X and W
     out = torch.matmul(X, W, out=out)
     if W_quant is not None:
-        del W
-    if A is not None:
-        out += (X @ A.to(dtype).to(device)) @ (s * B.to(dtype).to(device))
+        del W  # Free memory if no longer needed
+
+    # Add LoRA components if A and B are defined
+    if A is not None and B is not None:
+        # Ensure that A and B have compatible shapes for multiplication
+        A, B = A.t(), B.t()  # Adjust transpose based on shape requirements
+        try:
+            out += (X @ A.to(dtype).to(device)) @ (s * B.to(dtype).to(device))
+        except RuntimeError as e:
+            print(f"Error in matmul_lora: {e}")
+            print("Shape of X:", X.shape)
+            print("Shape of A:", A.shape)
+            print("Shape of B:", B.shape)
+            print("Shape of s:", s.shape)
+            raise e
+
     return out.view(batch, seq_len, -1) if reshape else out
