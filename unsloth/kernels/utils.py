@@ -174,8 +174,11 @@ def matmul_lora(X, W, W_quant, A, B, s, out=None):
     dtype = X.dtype
     device = X.device  # Ensure the operation happens on the correct GPU
 
-    # Dequantize W if quantization is present, and move to the appropriate device
-    W = fast_dequantize(W.t().to(device), W_quant)
+    # Check if W exists; if quantized, dequantize it and ensure it's on the correct device
+    if W_quant is not None:
+        W = fast_dequantize(W.t().to(device), W_quant)
+    else:
+        W = W.t().to(device)  # Transpose and move W to the appropriate device if it's not quantized
 
     # Adjust `X` shape if it's a 3D tensor to support batch processing
     reshape = X.dim() == 3
@@ -185,8 +188,10 @@ def matmul_lora(X, W, W_quant, A, B, s, out=None):
 
     # Perform the initial matrix multiplication between X and W
     out = torch.matmul(X, W, out=out)
+
+    # Free memory if W was dequantized and no longer needed
     if W_quant is not None:
-        del W  # Free memory if no longer needed
+        del W
 
     # Check if LoRA parameters A and B are present for additional transformations
     if A is not None and B is not None:
@@ -196,7 +201,7 @@ def matmul_lora(X, W, W_quant, A, B, s, out=None):
 
         # Update output with LoRA-based transformation
         try:
-            # Adjust for multi-GPU, ensuring alignment with device allocation
+            # Ensure alignment with device allocation and dimension compatibility for multi-GPU
             if A.shape[1] != X.shape[1] or B.shape[0] != W.shape[0]:
                 raise ValueError("Dimension mismatch for LoRA matrices in multi-GPU setting")
 
