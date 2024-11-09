@@ -172,32 +172,48 @@ def handle_lora(out, X, lora_A, lora_B, lora_S, bsz, in_dim, temp_lora):
     return out.view(bsz, 1, out_dim)
 def matmul_lora(X, W, W_quant, A, B, s, out=None):
     dtype = X.dtype
-    # Dequantize W if required
+    device = X.device  # Ensure the operation happens on the correct GPU
+
+    # Dequantize W if quantization is present, and move to the appropriate device
     W = fast_dequantize(W.t().to(device), W_quant)
-    
-    # Adjust reshape conditionally based on input dimensions
+
+    # Adjust `X` shape if it's a 3D tensor to support batch processing
     reshape = X.dim() == 3
     if reshape:
         batch, seq_len, d = X.shape
-        X = X.view(-1, X.shape[-1])
+        X = X.view(-1, X.shape[-1])  # Flatten for matrix multiplication
 
-    # Initial matrix multiplication of X and W
+    # Perform the initial matrix multiplication between X and W
     out = torch.matmul(X, W, out=out)
     if W_quant is not None:
         del W  # Free memory if no longer needed
 
-    # Add LoRA components if A and B are defined
+    # Check if LoRA parameters A and B are present for additional transformations
     if A is not None and B is not None:
-        # Ensure that A and B have compatible shapes for multiplication
-        A, B = A.t(), B.t()  # Adjust transpose based on shape requirements
+        # Ensure A and B are on the correct device, compatible with X and out
+        A = A.to(dtype).to(device)
+        B = B.to(dtype).to(device)
+
+        # Update output with LoRA-based transformation
         try:
-            out += (X @ A.to(dtype).to(device)) @ (s * B.to(dtype).to(device))
+            # Adjust for multi-GPU, ensuring alignment with device allocation
+            if A.shape[1] != X.shape[1] or B.shape[0] != W.shape[0]:
+                raise ValueError("Dimension mismatch for LoRA matrices in multi-GPU setting")
+
+            # Calculate the LoRA adjustment and add to the output
+            out += (X @ A) @ (s * B)
         except RuntimeError as e:
+            # Provide detailed debugging information in case of a shape mismatch or device misalignment
             print(f"Error in matmul_lora: {e}")
+            print("Device of X:", X.device)
+            print("Device of A:", A.device)
+            print("Device of B:", B.device)
+            print("Device of s:", s.device)
             print("Shape of X:", X.shape)
             print("Shape of A:", A.shape)
             print("Shape of B:", B.shape)
-            print("Shape of s:", s.shape)
+            print("Shape of W:", W.shape)
             raise e
 
+    # Reshape output if X was initially a 3D tensor
     return out.view(batch, seq_len, -1) if reshape else out
