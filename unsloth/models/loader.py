@@ -255,7 +255,7 @@ class FastLanguageModel(FastLlamaModel):
                     f'Try `pip install --upgrade "transformers>=4.43.2"`\n'\
                     f"to obtain the latest transformers build, then restart this session."\
                 ) 
-            # raise RuntimeError(autoconfig_error or peft_error)
+            raise RuntimeError(autoconfig_error or peft_error)
         pass
 
         # Get base model for PEFT:
