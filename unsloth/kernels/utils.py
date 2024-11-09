@@ -171,54 +171,70 @@ def handle_lora(out, X, lora_A, lora_B, lora_S, bsz, in_dim, temp_lora):
         out.addmm_(temp_lora, lora_B.t(), alpha=lora_S)
     return out.view(bsz, 1, out_dim)
 def matmul_lora(X, W, W_quant, A, B, s, out=None):
+    """
+    Performs matrix multiplication with LoRA (Low-Rank Adaptation) support.
+    
+    Args:
+        X: Input tensor
+        W: Weight matrix
+        W_quant: Quantized weights (if using quantization)
+        A: LoRA A matrix
+        B: LoRA B matrix
+        s: LoRA scaling factor
+        out: Optional output tensor
+    """
     dtype = X.dtype
-    device = X.device  # Ensure the operation happens on the correct GPU
-
-    # Check if W exists; if quantized, dequantize it and ensure it's on the correct device
-    if W_quant is not None:
-        W = fast_dequantize(W.t().to(device), W_quant)
-    else:
-        W = W.t().to(device)  # Transpose and move W to the appropriate device if it's not quantized
-
-    # Adjust `X` shape if it's a 3D tensor to support batch processing
+    device = X.device
+    
+    # Store original dimensions for later reshape
     reshape = X.dim() == 3
     if reshape:
         batch, seq_len, d = X.shape
-        X = X.view(-1, X.shape[-1])  # Flatten for matrix multiplication
-
-    # Perform the initial matrix multiplication between X and W
+        X = X.view(-1, X.shape[-1])
+    
+    # Handle weight matrix preparation first
+    if W_quant is not None:
+        W = fast_dequantize(W.t().to(device), W_quant)
+    else:
+        W = W.t().to(device)
+    
+    # Perform base matrix multiplication
     out = torch.matmul(X, W, out=out)
-
-    # Free memory if W was dequantized and no longer needed
+    
+    # Free memory if needed
     if W_quant is not None:
         del W
-
-    # Check if LoRA parameters A and B are present for additional transformations
+    
+    # Apply LoRA if parameters are provided
     if A is not None and B is not None:
-        # Ensure A and B are on the correct device, compatible with X and out
+        # Move LoRA matrices to correct device and dtype
         A = A.to(dtype).to(device)
         B = B.to(dtype).to(device)
-
-        # Update output with LoRA-based transformation
+        
         try:
-            # Ensure alignment with device allocation and dimension compatibility for multi-GPU
-            if A.shape[1] != X.shape[1] or B.shape[0] != W.shape[0]:
-                raise ValueError("Dimension mismatch for LoRA matrices in multi-GPU setting")
-
-            # Calculate the LoRA adjustment and add to the output
-            out += (X @ A) @ (s * B)
+            # Check dimensions before performing LoRA computations
+            if A.shape[1] != X.shape[1]:
+                raise ValueError(f"LoRA A matrix dimension mismatch. Expected shape[1]={X.shape[1]}, got {A.shape[1]}")
+            if B.shape[1] != A.shape[0]:
+                raise ValueError(f"LoRA B matrix dimension mismatch with A. Expected shape[1]={A.shape[0]}, got {B.shape[1]}")
+            
+            # Compute LoRA adjustment
+            lora_term = torch.matmul(X, A.t())  # First multiplication
+            lora_term = torch.matmul(lora_term, B)  # Second multiplication
+            out += s * lora_term
+            
         except RuntimeError as e:
-            # Provide detailed debugging information in case of a shape mismatch or device misalignment
-            print(f"Error in matmul_lora: {e}")
-            print("Device of X:", X.device)
-            print("Device of A:", A.device)
-            print("Device of B:", B.device)
-            print("Device of s:", s.device)
-            print("Shape of X:", X.shape)
-            print("Shape of A:", A.shape)
-            print("Shape of B:", B.shape)
-            print("Shape of W:", W.shape)
-            raise e
-
-    # Reshape output if X was initially a 3D tensor
-    return out.view(batch, seq_len, -1) if reshape else out
+            # Provide debugging information
+            error_msg = (f"LoRA computation failed:\n"
+                        f"X shape: {X.shape}, device: {X.device}\n"
+                        f"A shape: {A.shape}, device: {A.device}\n"
+                        f"B shape: {B.shape}, device: {B.device}\n"
+                        f"s: {s}, device: {getattr(s, 'device', 'scalar')}\n"
+                        f"Original error: {str(e)}")
+            raise RuntimeError(error_msg) from e
+    
+    # Restore original dimensions if needed
+    if reshape:
+        out = out.view(batch, seq_len, -1)
+    
+    return out
